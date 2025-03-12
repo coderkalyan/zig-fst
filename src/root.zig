@@ -72,10 +72,10 @@ pub const Header = struct {
     /// String identifier of the simulator that wrote the file.
     /// Underlying memory is owned by the string buffer.
     /// This identifier is at most 128 bytes.
-    writer: []const u8,
+    writer: std.BoundedArray(u8, 128),
     /// Date string as returned by asctime().
     /// This identifier is exactly 26 bytes.
-    date: *const [26]u8,
+    date: [26]u8,
     /// Order of magnitude of the time unit.
     /// 0 = 1s, 1 = 0.1s, 9 = 1ns, etc.
     timescale: i8,
@@ -86,12 +86,17 @@ pub const Header = struct {
     real_endian: std.builtin.Endian,
 
     pub fn read(reader: anytype) !Header {
+        // all ints are parsed as big endian (not sure why, most systems are little endian)
+        // reals can be set as either based on what the writer prefers. the detection process
+        // is strange, see below.
+
         const start_time = try reader.readInt(u64, .big);
         const end_time = try reader.readInt(u64, .big);
 
         // magic is
         var real_magic: f64 = undefined;
-        try reader.readAll(std.mem.asBytes(&real_magic));
+        var bytes_read = try reader.read(std.mem.asBytes(&real_magic));
+        std.debug.assert(bytes_read == @sizeOf(@TypeOf(real_magic)));
         // FIXME: calculate the actual endianness
 
         const writer_memory_use = try reader.readInt(u64, .big);
@@ -99,8 +104,39 @@ pub const Header = struct {
         const num_hierarchy_vars = try reader.readInt(u64, .big);
         const num_vars = try reader.readInt(u64, .big);
         const num_vc_blocks = try reader.readInt(u64, .big);
-        const timescale = try reader.readInt(i8, .little);
-        // try reader.skipBytes()
+        const timescale = try reader.readInt(i8, .big);
+
+        // the writer (simulator identifier) is a null terminated string at most 128 bytes
+        // use temporary array + bounded array to avoid allocating
+        var writer_buffer: [128]u8 = undefined;
+        const writer_slice = try reader.readUntilDelimiter(&writer_buffer, 0);
+        var writer = try std.BoundedArray(u8, writer_buffer.len).init(writer_slice.len);
+        @memcpy(writer.slice(), writer_slice);
+
+        var date_buffer: [26]u8 = undefined;
+        bytes_read = try reader.read(&date_buffer);
+        std.debug.assert(bytes_read == @sizeOf(@TypeOf(date_buffer)));
+
+        // header reserved bytes
+        try reader.skipBytes(93, .{});
+        const filetype: FileType = @enumFromInt(try reader.readInt(u8, .big));
+        const timezero = try reader.readInt(i64, .big);
+
+        return .{
+            .start_time = start_time,
+            .end_time = end_time,
+            .timezero = timezero,
+            .writer_memory_use = writer_memory_use,
+            .num_vc_blocks = num_vc_blocks,
+            .num_scopes = num_scopes,
+            .num_hierarchy_vars = num_hierarchy_vars,
+            .num_vars = num_vars,
+            .writer = writer,
+            .date = date_buffer,
+            .timescale = timescale,
+            .filetype = filetype,
+            .real_endian = .little, // FIXME: implement this
+        };
     }
 };
 
