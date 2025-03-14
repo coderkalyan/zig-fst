@@ -89,11 +89,11 @@ pub const Header = struct {
         // all ints are parsed as big endian (not sure why, most systems are little endian)
         // reals can be set as either based on what the writer prefers. the detection process
         // is strange, see below.
+        var buffer: [128]u8 = undefined;
 
         const start_time = try reader.readInt(u64, .big);
         const end_time = try reader.readInt(u64, .big);
 
-        // magic is
         var real_magic: f64 = undefined;
         var bytes_read = try reader.read(std.mem.asBytes(&real_magic));
         std.debug.assert(bytes_read == @sizeOf(@TypeOf(real_magic)));
@@ -106,16 +106,16 @@ pub const Header = struct {
         const num_vc_blocks = try reader.readInt(u64, .big);
         const timescale = try reader.readInt(i8, .big);
 
-        // the writer (simulator identifier) is a null terminated string at most 128 bytes
+        // the writer (simulator identifier) is a null terminated string occupying 128 bytes
         // use temporary array + bounded array to avoid allocating
-        var writer_buffer: [128]u8 = undefined;
-        const writer_slice = try reader.readUntilDelimiter(&writer_buffer, 0);
-        var writer = try std.BoundedArray(u8, writer_buffer.len).init(writer_slice.len);
-        @memcpy(writer.slice(), writer_slice);
+        bytes_read = try reader.read(&buffer);
+        std.debug.assert(bytes_read == buffer.len);
+        var writer: std.BoundedArray(u8, buffer.len) = .{};
+        const ptr: [*:0]const u8 = @ptrCast(&buffer);
+        writer.appendSliceAssumeCapacity(std.mem.span(ptr));
 
-        var date_buffer: [26]u8 = undefined;
-        bytes_read = try reader.read(&date_buffer);
-        std.debug.assert(bytes_read == @sizeOf(@TypeOf(date_buffer)));
+        bytes_read = try reader.read(buffer[0..26]);
+        std.debug.assert(bytes_read == 26);
 
         // header reserved bytes
         try reader.skipBytes(93, .{});
@@ -132,7 +132,7 @@ pub const Header = struct {
             .num_hierarchy_vars = num_hierarchy_vars,
             .num_vars = num_vars,
             .writer = writer,
-            .date = date_buffer,
+            .date = buffer[0..26].*,
             .timescale = timescale,
             .filetype = filetype,
             .real_endian = .little, // FIXME: implement this
@@ -149,6 +149,20 @@ pub const Geometry = struct {
     /// Uncompressed geometry data, consisting of lengths represented
     /// as variable length integers.
     uncompressed_data: []const u8,
+};
+
+pub const ValueChange = struct {
+    /// Start time of the block. The units are given by header_timescale.
+    start_time: u64,
+    /// End time of the block. The units are given by header_timescale.
+    end_time: u64,
+    /// Amount of buffer memory required when reading this block for a full Value Change traversal.
+    memory_required: u64,
+    /// Uncompressed length of the bits array.
+    bits_length: u64,
+
+    // const start_time = try reader.readInt(u64, .big);
+    // const end_time = try reader.readInt(u64, .big);
 };
 
 // pub const Blackout = struct {
