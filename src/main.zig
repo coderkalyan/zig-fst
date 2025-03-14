@@ -27,11 +27,12 @@ pub fn main() !void {
                 std.debug.print("{s} {s}\n", .{ header.writer.slice(), header.date });
             },
             .vcdata_dynamic_alias2 => {
-                _ = try fst.ValueChange.read(allocator, reader);
+                const vc = try fst.ValueChange.read(allocator, reader);
+                defer vc.deinit(allocator);
             },
             .geometry => {
                 const geometry = try fst.Geometry.read(allocator, reader);
-                std.debug.print("{x}\n", .{geometry.uncompressed_data});
+                // std.debug.print("{x}\n", .{geometry.data});
                 defer geometry.deinit(allocator);
             },
             else => {

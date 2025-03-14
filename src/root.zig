@@ -154,10 +154,10 @@ pub const Hierarchy = struct {
 };
 
 pub const Geometry = struct {
+    count: u64,
     /// Uncompressed geometry data, consisting of lengths represented
     /// as variable length integers.
-    count: u64,
-    uncompressed_data: []const u8,
+    data: []const u8,
 
     pub fn read(allocator: Allocator, reader: anytype) !Geometry {
         const block_length = try reader.readInt(u64, .big);
@@ -171,6 +171,7 @@ pub const Geometry = struct {
         const bytes_read = try reader.read(compressed_data);
         std.debug.assert(bytes_read == compressed_length);
         const uncompressed_data = try allocator.alloc(u8, uncompressed_length);
+        errdefer allocator.free(uncompressed_data);
         if (uncompressed_length != compressed_length) {
             var dest_len: u64 = uncompressed_data.len;
             const ret = c.uncompress(uncompressed_data.ptr, &dest_len, compressed_data.ptr, compressed_data.len);
@@ -183,12 +184,12 @@ pub const Geometry = struct {
 
         return .{
             .count = count,
-            .uncompressed_data = uncompressed_data,
+            .data = uncompressed_data,
         };
     }
 
     pub fn deinit(self: *const Geometry, allocator: Allocator) void {
-        allocator.free(self.uncompressed_data);
+        allocator.free(self.data);
     }
 };
 
@@ -199,35 +200,147 @@ pub const ValueChange = struct {
     end_time: u64,
     /// Amount of buffer memory required when reading this block for a full Value Change traversal.
     memory_required: u64,
-    /// Uncompressed length of the bits array.
-    bits_length: u64,
+    /// Number of entries in the bits table.
+    bits_count: u64,
+    /// Uncompressed bits array.
+    bits: []const u8,
+    /// Number of waveforms in the waves table.
+    waves_count: u64,
+    /// Uncompressed set of deduplicated waveforms for this time period.
+    waves: []const u8,
+    /// Uncompressed position data.
+    positions: []const u8,
+    /// Number of items in the time table.
+    times_count: u64,
+    /// Uncompressed time table.
+    times: []const u8,
 
-    pub fn read(allocator: Allocator, reader: anytype) !Header {
+    pub fn read(allocator: Allocator, reader: anytype) !ValueChange {
         const block_length = try reader.readInt(u64, .big);
         const start_time = try reader.readInt(u64, .big);
         const end_time = try reader.readInt(u64, .big);
         const memory_required = try reader.readInt(u64, .big);
-        std.debug.print("{} {} {} {}\n", .{ block_length, start_time, end_time, memory_required });
 
-        const bits_uncompressed_length = try readVarInt(reader);
-        const bits_compressed_length = try readVarInt(reader);
-        const bits_count = try readVarInt(reader);
-        _ = bits_count;
-        std.debug.print("{}\n", .{bits_uncompressed_length});
+        const preamble = 8 * 4;
+        const remaining = block_length - preamble;
+        const buffer = try allocator.alloc(u8, remaining);
+        defer allocator.free(buffer);
 
-        const compressed_bits = try allocator.alloc(u8, bits_compressed_length);
-        defer allocator.free(compressed_bits);
-        const bytes_read = try reader.read(compressed_bits);
-        std.debug.assert(bytes_read == compressed_bits.len);
+        // because of various variable length arrays in the block
+        // (no idea why it was designed this way), the best solution
+        // is to read the whole array and then start reading it backwards
+        const bytes_read = try reader.read(buffer);
+        std.debug.assert(bytes_read == buffer.len);
 
-        const waves_count = try readVarInt(reader);
-        _ = waves_count;
-        const waves_packtype: WriterPackType = @enumFromInt(try reader.readByte());
-        std.debug.print("{}\n", .{waves_packtype});
-        const waves_length = try readVarInt(reader);
-        std.debug.print("{}\n", .{waves_length});
+        // fixed buffer stream exposes a reader interface for the buffer
+        // which simplifies processing. it also allows seeking, which is
+        // used to consume the buffer effectively backwards as needed
+        var stream = std.io.fixedBufferStream(buffer);
+        const stream_reader = stream.reader();
 
-        return undefined;
+        // the first chunk of the variable length buffer can be read forwards,
+        // to grab the bits array and associated metadata
+        stream.seekTo(0) catch unreachable; // nop, just for clarity
+        // original code calls this the frame array
+        const bits_uncompressed_length = try readVarint64(stream_reader);
+        const bits_compressed_length = try readVarint64(stream_reader);
+        const bits_count = try readVarint64(stream_reader);
+
+        var forward_pos = stream.getPos() catch unreachable;
+        const bits_compressed = buffer[forward_pos .. forward_pos + bits_compressed_length];
+        stream.seekBy(@intCast(bits_compressed_length)) catch unreachable;
+
+        const waves_count = readVarint64(stream_reader) catch unreachable;
+        const waves_packtype: WriterPackType = @enumFromInt(stream_reader.readInt(u8, .big) catch unreachable);
+
+        // this is used to calculate the size of the waves data array
+        // based on whats remaining after reading from the start and end
+        forward_pos = stream.getPos() catch unreachable;
+
+        // seek to end and read the compressed time data, with
+        // length information stored after the data (again, why)
+        stream.seekTo(buffer.len - 24) catch unreachable;
+        const times_count = stream_reader.readInt(u64, .big) catch unreachable;
+        const times_compressed_length = stream_reader.readInt(u64, .big) catch unreachable;
+        const times_uncompressed_length = stream_reader.readInt(u64, .big) catch unreachable;
+
+        // now that we know the compressed length, grab the actual data
+        const time_end = buffer.len - 24;
+        const times_compressed = buffer[time_end - times_compressed_length .. time_end];
+        std.debug.assert(times_compressed.len == times_compressed_length);
+
+        // stream should be back at end
+        std.debug.assert((stream.getPos() catch unreachable) == buffer.len);
+        stream.seekBy(-24 - @as(i64, @intCast(times_compressed_length)) - 8) catch unreachable;
+        const position_length = stream_reader.readInt(u64, .big) catch unreachable;
+
+        const position_end = buffer.len - 24 - times_compressed_length - 8;
+        const positions_data = buffer[position_end - position_length .. position_end];
+        std.debug.assert(positions_data.len == position_length);
+
+        stream.seekBy(-8 - @as(i64, @intCast(position_length))) catch unreachable;
+        const waves_compressed = buffer[forward_pos .. forward_pos + (stream.getPos() catch unreachable)];
+
+        // decompress bits data
+        const bits_uncompressed = try allocator.alloc(u8, bits_uncompressed_length);
+        errdefer allocator.free(bits_uncompressed);
+        if (bits_uncompressed_length != bits_compressed_length) {
+            // bits is compressed with zlib, so uncompress
+            var dest_len: u64 = bits_uncompressed.len;
+            const ret = c.uncompress(bits_uncompressed.ptr, &dest_len, bits_compressed.ptr, bits_compressed.len);
+            if (ret != c.Z_OK) return error.ZlibDecompressionFailed;
+            std.debug.assert(dest_len == bits_uncompressed.len);
+        } else {
+            // bits data is uncompressed, just copy into return buffer
+            @memcpy(bits_uncompressed, bits_compressed);
+        }
+
+        // decompress waves data
+        std.debug.assert(waves_packtype == .zlib);
+        _ = waves_compressed;
+        // {
+        //     var dest_len: u64 = waves_compressed; // FIXME: whats the size here?
+        //     const ret = c.uncompress(bits_uncompressed.ptr, &dest_len, bits_compressed.ptr, bits_compressed.len);
+        //     if (ret != c.Z_OK) return error.ZlibDecompressionFailed;
+        //     std.debug.assert(dest_len == bits_compressed.len);
+        // }
+
+        // position data is uncompressed, just copy into return buffer
+        const positions_data_copy = try allocator.alloc(u8, positions_data.len);
+        errdefer allocator.free(positions_data_copy);
+        @memcpy(positions_data_copy, positions_data);
+
+        // decompress time data
+        const times_uncompressed = try allocator.alloc(u8, times_uncompressed_length);
+        errdefer allocator.free(times_uncompressed);
+        if (times_uncompressed_length != times_compressed_length) {
+            var dest_len: u64 = times_uncompressed.len;
+            const ret = c.uncompress(times_uncompressed.ptr, &dest_len, times_compressed.ptr, times_compressed.len);
+            if (ret != c.Z_OK) return error.ZlibDecompressionFailed;
+            std.debug.assert(dest_len == times_uncompressed.len);
+        } else {
+            // time data is uncompressed, just copy into return buffer
+            @memcpy(times_uncompressed, times_compressed);
+        }
+
+        return .{
+            .start_time = start_time,
+            .end_time = end_time,
+            .memory_required = memory_required,
+            .bits_count = bits_count,
+            .bits = bits_uncompressed,
+            .waves_count = waves_count,
+            .waves = undefined,
+            .positions = positions_data_copy,
+            .times_count = times_count,
+            .times = times_uncompressed,
+        };
+    }
+
+    pub fn deinit(self: *const ValueChange, allocator: Allocator) void {
+        allocator.free(self.bits);
+        allocator.free(self.positions);
+        allocator.free(self.times);
     }
 };
 
@@ -235,10 +348,10 @@ pub const ValueChange = struct {
 //     num_blackouts:
 // };
 
-fn readVarInt(reader: anytype) !u64 {
+fn readVarint64(reader: anytype) !u64 {
     var value: u64 = 0;
     for (0..8) |i| {
-        const byte = try reader.readByte();
+        const byte: u64 = try reader.readByte();
         value |= (byte & 0x7f) << @truncate(i * 7);
         if (byte & 0x80 == 0) return value;
     }
