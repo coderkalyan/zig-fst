@@ -35,9 +35,12 @@ pub fn main() !void {
                 // std.debug.print("{x}\n", .{geometry.data});
                 defer geometry.deinit(allocator);
             },
+            .hierarchy => {
+                const hierarchy = try fst.Hierarchy.read(allocator, reader);
+                defer hierarchy.deinit(allocator);
+            },
             else => {
                 const block_length = try reader.readInt(u64, .big);
-                std.debug.print("{} {}\n", .{ block_type, block_length });
                 try reader.skipBytes(block_length - @sizeOf(u64), .{});
             },
         }
