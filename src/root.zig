@@ -319,7 +319,6 @@ pub const ValueChange = struct {
         stream.seekBy(-8 - @as(i64, @intCast(positions_length))) catch unreachable;
         const waves_end = stream.getPos() catch unreachable;
         const waves_compressed = buffer[waves_start..waves_end];
-        _ = waves_compressed;
 
         // bits, positions, and times data is stored in the original (uncompressed)
         // varint format and can be backed by a single allocation
@@ -340,10 +339,31 @@ pub const ValueChange = struct {
         // decompress waves data
         // const waves_uncompressed = try allocator.alloc(u8, waves_uncompressed_length);
         // errdefer allocator.free(waves_uncompressed);
-        // const waves_uncompressed_length = readVarint64(reader) catch unreachable;
         // std.debug.print("{} {} {}\n", .{ waves_count, waves_packtype, waves_uncompressed_length });
         // if (waves_uncompressed_length != 0) {
         std.debug.assert(waves_packtype == .zlib);
+        for (0..waves_count) |_| {
+            // this dumb (and currently non-portable) solution is required because
+            // the data is compressed with gzip, not zlib, which has a different header
+            // and only exposes a parse file interface
+            const waves = data: {
+                const waves_uncompressed_length = readVarint64(reader) catch unreachable;
+
+                // linux doesn't seem to want this to be closed
+                const fd = try std.posix.memfd_create("fst", 0);
+                const bytes_written = try std.posix.write(fd, waves_compressed);
+                std.debug.assert(bytes_written == waves_compressed.len);
+
+                const file = c.gzdopen(fd, "r");
+                defer _ = c.gzclose(file);
+                const data = try allocator.alloc(u8, waves_uncompressed_length);
+                std.debug.assert(c.gzread(file, data.ptr, @intCast(data.len)) == 0);
+
+                break :data data;
+            };
+
+            _ = waves;
+        }
         //     var dest_len: u64 = waves_uncompressed_length;
         //     const ret = c.uncompress(waves_uncompressed.ptr, &dest_len, waves_compressed.ptr, waves_compressed.len);
         //     if (ret != c.Z_OK) return error.ZlibDecompressionFailed;
